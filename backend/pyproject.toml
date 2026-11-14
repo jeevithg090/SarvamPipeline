@@ -1,0 +1,18 @@
+[project]
+name = "sarvam-voice-agent-backend"
+version = "0.1.0"
+description = "Streaming Indian-language voice agent backend built on Sarvam STT, LLM and TTS APIs"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
