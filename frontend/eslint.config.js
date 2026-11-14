@@ -21,4 +21,8 @@ export default [
       'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
     },
   },
+  {
+    files: ['public/mic-worklet.js'],
+    languageOptions: { globals: globals.audioWorklet },
+  },
 ];
