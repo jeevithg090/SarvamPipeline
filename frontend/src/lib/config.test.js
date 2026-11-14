@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildWsUrl } from './config.js';
+import { buildHealthUrl, buildWsUrl } from './config.js';
 
 describe('buildWsUrl', () => {
   it('defaults to port 8004 on the page host', () => {
@@ -19,5 +19,17 @@ describe('buildWsUrl', () => {
   it('honours an explicit URL and encodes the model', () => {
     const url = buildWsUrl('a b', { envUrl: 'wss://api.example.com/ws?x=1' });
     expect(url).toBe('wss://api.example.com/ws?x=1&llm_model=a+b');
+  });
+});
+
+describe('buildHealthUrl', () => {
+  it('maps ws to http and /ws to /health', () => {
+    expect(buildHealthUrl('ws://localhost:8004/ws?llm_model=sarvam-30b')).toBe(
+      'http://localhost:8004/health',
+    );
+  });
+
+  it('maps wss to https and keeps a path prefix', () => {
+    expect(buildHealthUrl('wss://example.com/voice/ws')).toBe('https://example.com/voice/health');
   });
 });

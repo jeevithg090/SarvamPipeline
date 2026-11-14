@@ -2,16 +2,41 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Sarvam Voice Agent</title>
     <meta
       name="description"
-      content="Real-time voice agent for Indian languages, powered by Sarvam streaming speech-to-text, LLM and text-to-speech."
+      content="Talk to a real-time voice agent in Hindi, English, Hinglish and other Indian languages, powered by Sarvam streaming speech-to-text, LLM and text-to-speech."
     />
-    <meta name="theme-color" content="#ea580c" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#faf8f5" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#12100e" media="(prefers-color-scheme: dark)" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Sarvam Voice Agent" />
+    <meta property="og:title" content="Sarvam Voice Agent" />
+    <meta
+      property="og:description"
+      content="A real-time voice agent for Indian languages, built on Sarvam speech-to-text, LLM and text-to-speech."
+    />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Sarvam Voice Agent" />
+    <meta
+      name="twitter:description"
+      content="A real-time voice agent for Indian languages, built on Sarvam speech-to-text, LLM and text-to-speech."
+    />
+
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>Sarvam Voice Agent</title>
+    <script>
+      // Apply the saved theme before first paint to avoid a flash.
+      try {
+        var t = localStorage.getItem('theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    </script>
   </head>
   <body>
+    <noscript>This app needs JavaScript to capture your microphone and talk to the agent.</noscript>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
