@@ -1,35 +1,38 @@
-"""All-Sarvam voice agent: Saaras v3 streaming STT + Sarvam-30B LLM
+"""All-Sarvam voice agent: Saaras v3 streaming STT + Sarvam LLM
 (streaming, reasoning disabled for latency) + Bulbul v3 streaming TTS.
 
 Everything streams: STT has server-side VAD (high sensitivity = 0.5s
-end-of-turn), LLM tokens flow into TTS phrase-by-phrase, and the TTS
+end-of-turn), LLM tokens flow into TTS sentence-by-sentence, and the TTS
 connection opens in parallel with the LLM request.
+
+Browser <-> backend protocol on `/ws`:
+  * browser -> server: binary frames of 16 kHz mono PCM s16le audio
+  * server -> browser: binary frames of 24 kHz mono PCM s16le agent audio, and
+    JSON events: ConversationText, UserStartedSpeaking, Latency,
+    AgentAudioDone, Error
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
-import os
+import logging
 import time
+from typing import Any
 
-import httpx
-import websockets
-from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from sarvamai import AsyncSarvamAI
 
-from agent_functions import FUNCTION_DEFINITIONS, FUNCTION_MAP
+from config import ALLOWED_LLM_MODELS, settings
+from language import choose_tts_language
+from llm import LLMError, stream_llm
+from tts import FLUSH_MESSAGE, SentenceChunker, connect_tts, text_message
 
-load_dotenv()
-
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-
-SARVAM_TTS_URL = "wss://api.sarvam.ai/text-to-speech/ws?model=bulbul:v3&send_completion_event=true"
-SARVAM_LANGUAGE = os.getenv("SARVAM_LANGUAGE", "hi-IN")
-SARVAM_SPEAKER = os.getenv("SARVAM_SPEAKER", "shubh")
-STT_LANGUAGE = os.getenv("STT_LANGUAGE", "unknown")  # unknown = auto-detect
-LLM_MODEL = os.getenv("LLM_MODEL", "sarvam-30b")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("voice_agent")
 
 SYSTEM_PROMPT = (
     "You are a warm, friendly voice assistant for users in India, speaking "
@@ -40,312 +43,267 @@ SYSTEM_PROMPT = (
     "Never use markdown, lists or headings."
 )
 
-def detect_language_from_text(text: str) -> str:
-    """Detect language based on Unicode script blocks."""
-    char_counts = {
-        "hi-IN": 0, "bn-IN": 0, "gu-IN": 0, "or-IN": 0, "ta-IN": 0, 
-        "te-IN": 0, "kn-IN": 0, "ml-IN": 0, "pa-IN": 0, "en-IN": 0,
-    }
-    for char in text:
-        code = ord(char)
-        if 0x0900 <= code <= 0x097F: char_counts["hi-IN"] += 1
-        elif 0x0980 <= code <= 0x09FF: char_counts["bn-IN"] += 1
-        elif 0x0A80 <= code <= 0x0AFF: char_counts["gu-IN"] += 1
-        elif 0x0B00 <= code <= 0x0B7F: char_counts["or-IN"] += 1
-        elif 0x0B80 <= code <= 0x0BFF: char_counts["ta-IN"] += 1
-        elif 0x0C00 <= code <= 0x0C7F: char_counts["te-IN"] += 1
-        elif 0x0C80 <= code <= 0x0CFF: char_counts["kn-IN"] += 1
-        elif 0x0D00 <= code <= 0x0D7F: char_counts["ml-IN"] += 1
-        elif 0x0A00 <= code <= 0x0A7F: char_counts["pa-IN"] += 1
-        elif 0x0041 <= code <= 0x005A or 0x0061 <= code <= 0x007A: char_counts["en-IN"] += 1
-
-    max_lang = max(char_counts, key=char_counts.get)
-    if char_counts[max_lang] == 0:
-        return "en-IN"  # fallback
-    return max_lang
-
-OPENAI_TOOLS = [{"type": "function", "function": f} for f in FUNCTION_DEFINITIONS]
+# Keep the system prompt plus this many recent messages to bound prompt size.
+MAX_HISTORY_MESSAGES = 40
+# Upper bound on waiting for the TTS engine to finish after the last text.
+TTS_DRAIN_TIMEOUT_S = 30
 
 app = FastAPI(title="Sarvam Voice Agent")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=settings.allowed_origins,
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "sarvam_key": bool(SARVAM_API_KEY)}
+async def health() -> dict[str, Any]:
+    return {"status": "ok", "sarvam_key": bool(settings.sarvam_api_key)}
 
 
-async def stream_llm(messages: list, llm_model: str):
-    """Yield reply text deltas from Sarvam chat; handles the function loop."""
-    async with httpx.AsyncClient(timeout=60) as http:
-        while True:
-            tool_calls = {}
-            async with http.stream(
-                "POST",
-                "https://api.sarvam.ai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {SARVAM_API_KEY}"},
-                json={
-                    "model": llm_model,
-                    "messages": messages,
-                    "tools": OPENAI_TOOLS,
-                    "reasoning_effort": None,  # thinking off: latency-critical
-                    "max_tokens": 200,
-                    "stream": True,
-                },
-            ) as resp:
-                if resp.status_code != 200:
-                    text = await resp.aread()
-                    print("LLM Error:", resp.status_code, text)
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: ") or line == "data: [DONE]":
-                        continue
-                    chunk = json.loads(line[6:])
-                    if not chunk.get("choices"):
-                        continue
-                    delta = chunk["choices"][0].get("delta") or {}
-                    if delta.get("content"):
-                        yield delta["content"]
-                    for tc in delta.get("tool_calls") or []:
-                        slot = tool_calls.setdefault(
-                            tc.get("index", 0), {"id": "", "name": "", "arguments": ""}
-                        )
-                        if tc.get("id"):
-                            slot["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            slot["name"] += fn["name"]
-                        if fn.get("arguments"):
-                            slot["arguments"] += fn["arguments"]
+def origin_allowed(origin: str | None) -> bool:
+    """Websockets bypass CORS, so check the Origin header explicitly.
 
-            if not tool_calls:
-                return
-
-            calls = [tool_calls[i] for i in sorted(tool_calls)]
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": c["id"], "type": "function",
-                     "function": {"name": c["name"], "arguments": c["arguments"]}}
-                    for c in calls
-                ],
-            })
-            for c in calls:
-                func = FUNCTION_MAP.get(c["name"])
-                try:
-                    args = json.loads(c["arguments"] or "{}")
-                    if not isinstance(args, dict):
-                        args = {}
-                    result = await func(args) if func else {"error": "unknown function"}
-                except Exception as e:
-                    result = {"error": str(e)}
-                messages.append({
-                    "role": "tool", "tool_call_id": c["id"], "content": json.dumps(result),
-                })
+    Requests without an Origin header (non-browser clients) are allowed.
+    """
+    if origin is None or "*" in settings.allowed_origins:
+        return True
+    return origin in settings.allowed_origins
 
 
-async def connect_tts(language: str, speaker: str):
-    tts = await websockets.connect(
-        SARVAM_TTS_URL,
-        additional_headers={"api-subscription-key": SARVAM_API_KEY},
-    )
-    await tts.send(json.dumps({
-        "type": "config",
-        "data": {
-            "target_language_code": language,
-            "speaker": speaker,
-            "speech_sample_rate": "24000",
-            "output_audio_codec": "linear16",
-            "min_buffer_size": 30,
-            "max_chunk_length": 250,
-            "temperature": 0.7,  # bulbul:v3 expressiveness
-            "pace": 0.95,
-        },
-    }))
-    return tts
+def add_user_turn(history: list[dict[str, Any]], text: str) -> None:
+    """Append a user message, merging with a previous unanswered one (barge-in)."""
+    if history and history[-1]["role"] == "user":
+        history[-1] = {"role": "user", "content": f"{history[-1]['content']} {text}"}
+    else:
+        history.append({"role": "user", "content": text})
+    overflow = len(history) - 1 - MAX_HISTORY_MESSAGES
+    if overflow > 0:
+        del history[1 : 1 + overflow]
 
 
-@app.websocket("/ws")
-async def voice_agent(client_ws: WebSocket, llm_model: str = None):
-    await client_ws.accept()
+class CallSession:
+    """State and pipeline for one browser call."""
 
-    active_llm_model = llm_model or LLM_MODEL
+    def __init__(self, client_ws: WebSocket, llm_model: str, api_key: str) -> None:
+        self.client_ws = client_ws
+        self.llm_model = llm_model
+        self.api_key = api_key
+        self.history: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.generation = 0
+        self.respond_task: asyncio.Task | None = None
 
-    if not SARVAM_API_KEY:
-        await client_ws.send_json({"type": "Error", "description": "SARVAM_API_KEY not set"})
-        await client_ws.close()
-        return
+    async def send_event(self, payload: dict[str, Any]) -> None:
+        with contextlib.suppress(WebSocketDisconnect, RuntimeError):
+            await self.client_ws.send_json(payload)
 
-    history = [{"role": "system", "content": SYSTEM_PROMPT}]
-    generation = [0]
-    respond_task = None
+    def interrupt(self) -> bool:
+        """Cancel the in-flight reply, if any. Returns True if one was cancelled."""
+        self.generation += 1
+        if self.respond_task and not self.respond_task.done():
+            self.respond_task.cancel()
+            return True
+        return False
 
-    sarvam = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
-    async with sarvam.speech_to_text_streaming.connect(
-        model="saaras:v3",
-        mode="transcribe",
-        language_code=STT_LANGUAGE,
-        sample_rate="16000",
-        input_audio_codec="pcm_s16le",
-        vad_signals="true",
-        high_vad_sensitivity="true",  # 0.5s end-of-turn silence boundary
-    ) as stt:
+    def start_reply(self, transcript: str, stt_language: str | None) -> None:
+        self.interrupt()
+        self.respond_task = asyncio.create_task(
+            self.respond(transcript, stt_language, self.generation)
+        )
 
-        async def respond(user_text: str, my_gen: int):
-            try:
-                await _respond(user_text, my_gen)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                import traceback
-                traceback.print_exc()
+    async def respond(self, user_text: str, stt_language: str | None, my_gen: int) -> None:
+        try:
+            await self._respond(user_text, stt_language, my_gen)
+        except asyncio.CancelledError:
+            raise
+        except LLMError as exc:
+            await self.send_event({"type": "Error", "description": str(exc)})
+        except Exception:
+            logger.exception("Reply generation failed")
+            await self.send_event({"type": "Error", "description": "Failed to generate a reply"})
 
-        async def _respond(user_text: str, my_gen: int):
-            start_time = time.time()
-            history.append({"role": "user", "content": user_text})
-            messages = list(history)
-            reply_parts = []
+    async def _respond(self, user_text: str, stt_language: str | None, my_gen: int) -> None:
+        start_time = time.monotonic()
+        add_user_turn(self.history, user_text)
+        messages = list(self.history)
+        reply_parts: list[str] = []
 
-            detected_lang = detect_language_from_text(user_text)
-
-            tts_task = asyncio.create_task(connect_tts(detected_lang, SARVAM_SPEAKER))
-            llm = stream_llm(messages, active_llm_model)
-            
+        language = choose_tts_language(stt_language, user_text, default=settings.tts_language)
+        tts_task = asyncio.create_task(connect_tts(language, settings.tts_speaker, self.api_key))
+        llm = stream_llm(messages, self.llm_model, self.api_key)
+        tts = None
+        audio_task: asyncio.Task | None = None
+        try:
             try:
                 first = await llm.__anext__()
             except StopAsyncIteration:
                 first = None
-                
+            if first is None:
+                return  # nothing to say
+
             tts = await tts_task
-            try:
-                async def forward_audio():
-                    first_audio_sent = False
-                    async for raw in tts:
-                        if generation[0] != my_gen:
-                            return
-                        msg = json.loads(raw)
-                        if msg.get("type") == "audio":
-                            if not first_audio_sent:
-                                latency_ms = int((time.time() - start_time) * 1000)
-                                await client_ws.send_json({"type": "Latency", "latency_ms": latency_ms})
-                                first_audio_sent = True
-                            await client_ws.send_bytes(base64.b64decode(msg["data"]["audio"]))
-                        elif msg.get("type") == "event" and msg["data"].get("event_type") == "final":
-                            return
-                        elif msg.get("type") == "error":
-                            await client_ws.send_json({
-                                "type": "Error", "description": msg["data"].get("message", ""),
-                            })
-                            return
 
-                audio_task = asyncio.create_task(forward_audio())
+            async def forward_audio() -> None:
+                first_audio_sent = False
+                async for raw in tts:
+                    if self.generation != my_gen:
+                        return
+                    msg = json.loads(raw)
+                    msg_type = msg.get("type")
+                    data = msg.get("data") or {}
+                    if msg_type == "audio":
+                        if not first_audio_sent:
+                            latency_ms = int((time.monotonic() - start_time) * 1000)
+                            await self.send_event({"type": "Latency", "latency_ms": latency_ms})
+                            first_audio_sent = True
+                        await self.client_ws.send_bytes(base64.b64decode(data["audio"]))
+                    elif msg_type == "event" and data.get("event_type") == "final":
+                        return
+                    elif msg_type == "error":
+                        logger.error("TTS error: %s", data)
+                        await self.send_event(
+                            {"type": "Error", "description": data.get("message", "TTS error")}
+                        )
+                        return
 
-                buffer = ""
-                sent_first = False
+            audio_task = asyncio.create_task(forward_audio())
+            chunker = SentenceChunker()
 
-                async def maybe_send(buf, force=False):
-                    # full sentences only: comma-level fragments make the TTS
-                    # prosody flat and robotic
-                    nonlocal sent_first
-                    boundary = buf.rstrip().endswith((".", "!", "?", "।"))
-                    min_len = 1 if not sent_first else 40
-                    if force or (boundary and len(buf) >= min_len):
-                        if buf.strip():
-                            await tts.send(json.dumps({"type": "text", "data": {"text": buf}}))
-                            sent_first = True
-                        return ""
-                    return buf
+            async def consume(delta: str) -> None:
+                reply_parts.append(delta)
+                ready = chunker.feed(delta)
+                if ready:
+                    await tts.send(text_message(ready))
 
-                async def consume(delta):
-                    nonlocal buffer
-                    reply_parts.append(delta)
-                    buffer += delta
-                    buffer = await maybe_send(buffer)
+            await consume(first)
+            async for delta in llm:
+                if self.generation != my_gen:
+                    break
+                await consume(delta)
 
-                if first is not None:
-                    await consume(first)
-                    async for delta in llm:
-                        if generation[0] != my_gen:
-                            break
-                        await consume(delta)
-
-                if generation[0] == my_gen:
-                    await maybe_send(buffer, force=True)
-                    await tts.send(json.dumps({"type": "flush"}))
-                    await audio_task
-                else:
-                    audio_task.cancel()
-            finally:
+            if self.generation == my_gen:
+                rest = chunker.flush()
+                if rest:
+                    await tts.send(text_message(rest))
+                await tts.send(FLUSH_MESSAGE)
+                await asyncio.wait_for(audio_task, timeout=TTS_DRAIN_TIMEOUT_S)
+        finally:
+            await llm.aclose()
+            if audio_task and not audio_task.done():
+                audio_task.cancel()
+            if tts is None:
+                tts_task.cancel()
+                with contextlib.suppress(BaseException):
+                    tts = await tts_task
+            if tts is not None:
                 await tts.close()
 
-            reply = "".join(reply_parts)
-            if generation[0] == my_gen and reply:
-                history.append({"role": "assistant", "content": reply})
-                await client_ws.send_json({
-                    "type": "ConversationText", "role": "assistant", "content": reply,
-                })
-                await client_ws.send_json({"type": "AgentAudioDone"})
+        reply = "".join(reply_parts)
+        if self.generation == my_gen and reply:
+            self.history.append({"role": "assistant", "content": reply})
+            await self.send_event(
+                {"type": "ConversationText", "role": "assistant", "content": reply}
+            )
+            await self.send_event({"type": "AgentAudioDone"})
 
-        async def browser_to_stt():
-            while True:
-                message = await client_ws.receive()
-                if message.get("type") == "websocket.disconnect":
-                    break
-                if message.get("bytes") is not None:
-                    await stt.transcribe(
-                        audio=base64.b64encode(message["bytes"]).decode(),
-                        encoding="audio/wav",  # SDK literal; raw PCM is set via input_audio_codec
-                        sample_rate=16000,
-                    )
+    async def browser_to_stt(self, stt: Any) -> None:
+        while True:
+            message = await self.client_ws.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+            audio = message.get("bytes")
+            if audio:
+                await stt.transcribe(
+                    audio=base64.b64encode(audio).decode(),
+                    encoding="audio/wav",  # SDK literal; raw PCM is set via input_audio_codec
+                    sample_rate=16000,
+                )
 
-        async def stt_loop():
-            nonlocal respond_task
-            while True:
-                resp = await stt.recv()
-                rtype = getattr(resp, "type", None)
-                data = getattr(resp, "data", None)
-                if rtype == "events":
-                    signal = getattr(data, "signal_type", "") or ""
-                    if "START" in signal and respond_task and not respond_task.done():
-                        generation[0] += 1
-                        respond_task.cancel()
-                        await client_ws.send_json({"type": "UserStartedSpeaking"})
-                    continue
-                transcript = (getattr(data, "transcript", "") or "").strip()
-                if not transcript:
-                    continue
-                await client_ws.send_json({
-                    "type": "ConversationText", "role": "user", "content": transcript,
-                })
-                if respond_task and not respond_task.done():
-                    generation[0] += 1
-                    respond_task.cancel()
-                generation[0] += 1
-                respond_task = asyncio.create_task(respond(transcript, generation[0]))
+    async def stt_loop(self, stt: Any) -> None:
+        while True:
+            resp = await stt.recv()
+            rtype = getattr(resp, "type", None)
+            data = getattr(resp, "data", None)
+            if rtype == "events":
+                signal = getattr(data, "signal_type", "") or ""
+                if "START" in signal and self.interrupt():
+                    await self.send_event({"type": "UserStartedSpeaking"})
+                continue
+            if rtype == "error":
+                logger.error("STT error: %s", data)
+                continue
+            transcript = (getattr(data, "transcript", "") or "").strip()
+            if not transcript:
+                continue
+            await self.send_event(
+                {"type": "ConversationText", "role": "user", "content": transcript}
+            )
+            self.start_reply(transcript, getattr(data, "language_code", None))
 
-        tasks = [
-            asyncio.create_task(browser_to_stt()),
-            asyncio.create_task(stt_loop()),
-        ]
-        try:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        except WebSocketDisconnect:
-            pass
-        finally:
-            for task in tasks:
-                task.cancel()
-            if respond_task:
-                respond_task.cancel()
+    async def run(self) -> None:
+        sarvam = AsyncSarvamAI(api_subscription_key=self.api_key)
+        async with sarvam.speech_to_text_streaming.connect(
+            model="saaras:v3",
+            mode="transcribe",
+            language_code=settings.stt_language,
+            sample_rate="16000",
+            input_audio_codec="pcm_s16le",
+            vad_signals="true",
+            high_vad_sensitivity="true",  # 0.5s end-of-turn silence boundary
+        ) as stt:
+            tasks = [
+                asyncio.create_task(self.browser_to_stt(stt)),
+                asyncio.create_task(self.stt_loop(stt)),
+            ]
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    exc = task.exception()
+                    if exc and not isinstance(exc, WebSocketDisconnect):
+                        logger.error("Call pipeline stopped: %r", exc)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                self.interrupt()
+
+
+@app.websocket("/ws")
+async def voice_agent(client_ws: WebSocket, llm_model: str | None = None) -> None:
+    if not origin_allowed(client_ws.headers.get("origin")):
+        await client_ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await client_ws.accept()
+
+    model = llm_model or settings.llm_model
+    if model not in ALLOWED_LLM_MODELS:
+        await client_ws.send_json(
+            {"type": "Error", "description": f"Unsupported LLM model: {model}"}
+        )
+        await client_ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    if not settings.sarvam_api_key:
+        await client_ws.send_json({"type": "Error", "description": "SARVAM_API_KEY not set"})
+        await client_ws.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
+
+    session = CallSession(client_ws, model, settings.sarvam_api_key)
+    try:
+        await session.run()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        logger.exception("Call failed")
+        await session.send_event({"type": "Error", "description": "Speech recognition unavailable"})
+    finally:
+        with contextlib.suppress(RuntimeError):
+            await client_ws.close()
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8004, reload=True)
+    uvicorn.run("main:app", host=settings.host, port=settings.port)
