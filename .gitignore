@@ -1,5 +1,24 @@
+# Dependencies / environments
 node_modules/
 .venv/
+venv/
+
+# Secrets
 .env
-.DS_Store
+.env.*
+!.env.example
+
+# Build output and caches
+dist/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.log
