@@ -1,26 +1,36 @@
 """Function calling for the voice agent.
 
-Three layers, following deepgram-devs/flask-agent-function-calling-demo:
-definitions (sent to the LLM) -> FUNCTION_MAP (routing) -> implementations.
+Three layers: definitions (sent to the LLM) -> FUNCTION_MAP (routing) ->
+implementations. The implementations below are demo stubs; replace them
+with real services.
 """
 
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+AgentFunction = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 # --- Implementations (mock business logic; replace with real services) ---
 
 
-async def get_current_time(arguments: dict) -> dict:
+async def get_current_time(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"current_time": datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")}
 
 
-async def get_weather(arguments: dict) -> dict:
-    city = arguments.get("city", "unknown")
+async def get_weather(arguments: dict[str, Any]) -> dict[str, Any]:
+    city = str(arguments.get("city") or "unknown")
     return {"city": city, "forecast": "sunny", "temperature_c": 31}
 
 
-# --- Definitions sent to the LLM in Settings ---
+# --- Definitions sent to the LLM as OpenAI-style tools ---
 
-FUNCTION_DEFINITIONS = [
+FUNCTION_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_current_time",
         "description": "Get the current local date and time.",
@@ -39,7 +49,19 @@ FUNCTION_DEFINITIONS = [
     },
 ]
 
-FUNCTION_MAP = {
+FUNCTION_MAP: dict[str, AgentFunction] = {
     "get_current_time": get_current_time,
     "get_weather": get_weather,
 }
+
+
+async def call_function(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Run a tool by name, converting failures into an error payload for the LLM."""
+    func = FUNCTION_MAP.get(name)
+    if func is None:
+        return {"error": f"unknown function: {name}"}
+    try:
+        return await func(arguments)
+    except Exception as exc:  # errors are reported back to the model
+        logger.exception("Function %s failed", name)
+        return {"error": str(exc)}
